@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PSD File Reader and Writer</title>
+    <script src="psd-bundle.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            align-items: stretch;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+            background: #f6f8fb;
+            color: #111827;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        h1 {
+            margin: 0 0 16px;
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        .panel {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            width: 100%;
+        }
+
+        button {
+            min-height: 48px;
+            padding: 12px 18px;
+            background-color: #2563eb;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        button:disabled {
+            cursor: not-allowed;
+            background-color: #94a3b8;
+        }
+
+        input[type="file"] {
+            width: 100%;
+            min-height: 48px;
+            padding: 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            background: #fff;
+            font-size: 15px;
+        }
+
+        #statusText {
+            min-height: 20px;
+            margin: 0;
+            color: #475569;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+
+<body>
+<div class="panel">
+    <h1>选择 PSD 文件</h1>
+    <input type="file" id="psdFileInput" accept=".psd,.psb,application/octet-stream" />
+    <button id="parseButton" onclick="uploadFile()">解析 PSD</button>
+    <p id="statusText">解析会在本机完成，图层图片将保存到 App 文档目录。</p>
+</div>
+<script>
+    const statusText = document.getElementById('statusText');
+    const parseButton = document.getElementById('parseButton');
+
+    function setBusy(isBusy, message) {
+        parseButton.disabled = isBusy;
+        statusText.textContent = message || '';
+    }
+
+    function callFlutter(handlerName, ...args) {
+        if (!window.flutter_inappwebview) {
+            return Promise.reject(new Error('Flutter bridge is not ready.'));
+        }
+        return window.flutter_inappwebview.callHandler(handlerName, ...args);
+    }
+
+    async function uploadFile() {
+        const fileInput = document.getElementById('psdFileInput');
+        const file = fileInput.files[0];
+        if (!file) {
+            setBusy(false, '请先选择一个 PSD 文件。');
+            return;
+        }
+
+        setBusy(true, '正在读取文件...');
+        await callFlutter('showLoading', `正在读取 ${file.name}`);
+
+        const reader = new FileReader();
+        reader.onload = async function (e) {
+            try {
+                const buffer = e.target.result;
+                setBusy(true, '正在解析 PSD...');
+                const psd = agPsd.readPsd(buffer, {
+                    skipCompositeImageData: true,
+                    skipLayerImageData: false,
+                });
+
+                const imagePaths = [];
+                const issues = [];
+                await processLayersRecursively(psd.children || [], imagePaths, issues);
+                const cleanedPsd = cleanPsdForJson(psd);
+
+                setBusy(true, '正在同步解析结果...');
+                await callFlutter('psdUpdated', {
+                    fileName: file.name,
+                    fileSize: file.size,
+                    imageCount: imagePaths.length,
+                    psd: cleanedPsd,
+                    images: imagePaths,
+                    issues,
+                });
+                psd.children = [];
+                imagePaths.length = 0;
+            } catch (error) {
+                const message = error && error.message ? error.message : String(error);
+                setBusy(false, `解析失败：${message}`);
+                await callFlutter('parseError', message);
+            }
+        };
+        reader.onerror = async function () {
+            const message = '文件读取失败，请重新选择 PSD 文件。';
+            setBusy(false, message);
+            await callFlutter('parseError', message);
+        };
+        reader.readAsArrayBuffer(file);
+    }
+
+    async function processLayersRecursively(layers, imagePaths, issues, parentPath = '') {
+        for (let index = 0; index < layers.length; index += 1) {
+            const layer = layers[index];
+            const layerPath = parentPath ? `${parentPath}/${index}` : `${index}`;
+            if (layer.children && layer.children.length > 0) {
+                await processLayersRecursively(layer.children, imagePaths, issues, layerPath);
+                continue;
+            }
+            await processLayer(layer, layerPath, imagePaths, issues);
+        }
+    }
+
+    async function processLayer(layer, layerPath, imagePaths, issues) {
+        if (!layer.canvas) {
+            return;
+        }
+
+        const canvas = layer.canvas;
+        let transfer = null;
+        try {
+            transfer = await callFlutter('startImageSave', {
+                id: layer.id || layerPath,
+                name: layer.name || `layer_${layerPath}`,
+                path: layerPath,
+                width: canvas.width,
+                height: canvas.height,
+            });
+            await writeCanvasRgbaChunks(canvas, transfer.transferId);
+            const savedPath = await callFlutter('finishImageSave', {
+                transferId: transfer.transferId,
+            });
+            layer.imageUrl = savedPath;
+            imagePaths.push(savedPath);
+            setBusy(true, `已保存 ${imagePaths.length} 张图层图片...`);
+        } catch (error) {
+            if (transfer && transfer.transferId) {
+                await callFlutter('abortImageSave', {
+                    transferId: transfer.transferId,
+                }).catch(() => {});
+            }
+            issues.push(createIssue(
+                'image',
+                `${layer.name || '未命名图层'} (${layerPath})`,
+                error,
+            ));
+            setBusy(true, `图层 ${layer.name || layerPath} 保存失败，继续处理...`);
+        } finally {
+            canvas.width = 1;
+            canvas.height = 1;
+            delete layer.canvas;
+            delete layer.imageData;
+            await waitForMemoryRelease();
+        }
+    }
+
+    function createIssue(stage, target, error) {
+        return {
+            stage,
+            target,
+            message: error && error.message ? error.message : String(error),
+        };
+    }
+
+    async function writeCanvasRgbaChunks(canvas, transferId) {
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        const srcStride = canvas.width * 4;
+        const maxChunkBytes = 128 * 1024;
+        const rowsPerChunk = Math.max(1, Math.floor(maxChunkBytes / srcStride));
+        for (let y = 0; y < canvas.height; y += rowsPerChunk) {
+            const rows = Math.min(rowsPerChunk, canvas.height - y);
+            const imageData = context.getImageData(0, y, canvas.width, rows);
+            const base64 = bytesToBase64(imageData.data);
+            await callFlutter('appendImageChunk', {
+                transferId,
+                base64,
+                rows,
+                srcStride,
+            });
+            await waitForNextFrame();
+        }
+    }
+
+    function bytesToBase64(bytes) {
+        let binary = '';
+        const subChunkSize = 0x10000; // 64KB
+        for (let offset = 0; offset < bytes.length; offset += subChunkSize) {
+            const subChunk = bytes.subarray(offset, offset + subChunkSize);
+            binary += String.fromCharCode.apply(null, subChunk);
+        }
+        return btoa(binary);
+    }
+
+    function waitForNextFrame() {
+        return new Promise((resolve) => {
+            if (window.requestAnimationFrame) {
+                window.requestAnimationFrame(() => resolve());
+                return;
+            }
+            setTimeout(resolve, 0);
+        });
+    }
+
+    async function waitForMemoryRelease() {
+        await waitForNextFrame();
+        await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+
+    function cleanPsdForJson(value) {
+        if (Array.isArray(value)) {
+            return value.map(cleanPsdForJson);
+        }
+        if (!value || typeof value !== 'object') {
+            return value;
+        }
+        if (
+            value instanceof HTMLCanvasElement ||
+            value instanceof ImageData ||
+            value instanceof ArrayBuffer ||
+            ArrayBuffer.isView(value)
+        ) {
+            return undefined;
+        }
+
+        const output = {};
+        Object.keys(value).forEach((key) => {
+            if (
+                key === 'canvas' ||
+                key === 'imageData' ||
+                key === 'imageDataRaw' ||
+                key === 'maskDataRaw'
+            ) {
+                return;
+            }
+            const cleaned = cleanPsdForJson(value[key]);
+            if (cleaned !== undefined) {
+                output[key] = cleaned;
+            }
+        });
+        return output;
+    }
+</script>
+</body>
+
+</html>
